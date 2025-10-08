@@ -1,0 +1,445 @@
+"""
+S3 Data Redundancy Removal Tool (corrected)
+-------------------------------------------
+Single-file Python utility to detect and handle duplicate objects in an AWS S3 bucket.
+
+Key fixes & improvements:
+- Batch hashing per-size-group to avoid keeping millions of futures in memory.
+- Close S3 streaming bodies reliably.
+- Use head_object metadata 'sha256' if available to avoid downloading objects repeatedly.
+- Use posixpath for S3 key composition (avoids Windows backslash issues).
+- Safer error handling: individual object failures are logged but do not abort the whole job.
+- Minor cleanup: removed unused imports and corrected docstrings/options.
+
+Requirements
+- Python 3.9+
+- boto3
+- tqdm (optional)
+
+Usage (CLI):
+    python s3_deduplication.py --bucket my-bucket --mode dry-run
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+import hashlib
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from typing import Dict, List, Optional
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
+import posixpath  # use for S3 key concatenation
+
+# ------------------------- Configuration & Logging -------------------------
+LOG = logging.getLogger("s3_dedup")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+# Default boto3 client config to improve throughput/retries
+BOTO_CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"})
+
+# ------------------------- Utility functions -------------------------------
+
+
+def compute_s3_object_sha256(s3_client, bucket: str, key: str, chunk_size: int = 8 * 1024 * 1024) -> str:
+    """
+    Stream an S3 object and compute SHA256 hex digest.
+    Ensures the streaming body is closed even on error.
+    """
+    h = hashlib.sha256()
+    stream = None
+    try:
+        resp = s3_client.get_object(Bucket=bucket, Key=key)
+        stream = resp["Body"]
+        while True:
+            data = stream.read(chunk_size)
+            if not data:
+                break
+            h.update(data)
+        return h.hexdigest()
+    except ClientError as e:
+        LOG.error("Failed to read s3://%s/%s: %s", bucket, key, e)
+        raise
+    finally:
+        # ensure body is closed to free up connection
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+
+
+def get_object_stored_hash(s3_client, bucket: str, key: str) -> Optional[str]:
+    """
+    If the object has metadata that stores a precomputed sha256 (e.g. x-amz-meta-sha256),
+    return it. This helps avoid re-downloading large objects repeatedly across runs.
+    """
+    try:
+        head = s3_client.head_object(Bucket=bucket, Key=key)
+        metadata = head.get("Metadata", {}) or {}
+        # common practice: metadata keys are lowercase in boto3
+        return metadata.get("sha256") or metadata.get("x-amz-meta-sha256")
+    except ClientError as e:
+        LOG.debug("Failed to HEAD s3://%s/%s: %s", bucket, key, e)
+        return None
+
+
+def list_s3_objects(s3_client, bucket: str, prefix: Optional[str] = None) -> List[Dict]:
+    """
+    List objects (single-version) using paginated list_objects_v2.
+    Returns list of object dicts (each includes Key, Size, LastModified, ETag).
+    """
+    paginator = s3_client.get_paginator("list_objects_v2")
+    pagination_args = {"Bucket": bucket}
+    if prefix:
+        pagination_args["Prefix"] = prefix
+    objs: List[Dict] = []
+    try:
+        for page in paginator.paginate(**pagination_args):
+            contents = page.get("Contents", [])
+            if contents:
+                objs.extend(contents)
+    except ClientError as e:
+        LOG.error("Failed to list objects in s3://%s/%s: %s", bucket, prefix or "", e)
+        raise
+    return objs
+
+
+# ------------------------- Main dedup logic --------------------------------
+
+
+def find_duplicates(
+    s3_client,
+    bucket: str,
+    prefix: Optional[str] = None,
+    threads: int = 8,
+    use_etag_quickcheck: bool = True,
+    batch_mode: bool = True,
+) -> Dict[str, List[Dict]]:
+    """
+    Scan bucket and return mapping from content-hash -> list(object metadata).
+    Strategy:
+      - List objects and group by size.
+      - For each size group with more than one object, compute/check content hash.
+      - Uses head_object metadata 'sha256' when present.
+    Notes:
+      - ETag quick-check is used only when ETag does not contain '-' (i.e. likely single-part MD5).
+      - If batch_mode is True, tasks are submitted per size-group and completed before moving to next group
+        to avoid building a giant futures list when there are many objects.
+    """
+    if not bucket:
+        raise ValueError("bucket name must be provided")
+
+    LOG.info("Listing objects in s3://%s/%s", bucket, prefix or "")
+    objs = list_s3_objects(s3_client, bucket, prefix)
+    LOG.info("Found %d objects", len(objs))
+
+    # Group by size
+    size_groups: Dict[int, List[Dict]] = {}
+    for o in objs:
+        size_groups.setdefault(o["Size"], []).append(o)
+
+    duplicates: Dict[str, List[Dict]] = {}
+
+    def compute_for_obj(obj: Dict) -> Optional[tuple]:
+        """
+        Compute (content_hash, obj) or return None on failure.
+        content_hash form: "<size>:<hex>" where <hex> is etag or sha256.
+        """
+        key = obj["Key"]
+        size = obj["Size"]
+        # try using stored sha256 metadata to avoid download
+        try:
+            stored_sha = get_object_stored_hash(s3_client, bucket, key)
+        except Exception:
+            stored_sha = None
+
+        if stored_sha:
+            content_hash = f"{size}:{stored_sha}"
+            LOG.debug("Used stored sha256 metadata for %s -> %s", key, content_hash)
+            return content_hash, obj
+
+        etag = (obj.get("ETag") or "").strip('"')
+        if use_etag_quickcheck and etag and "-" not in etag:
+            # ETag likely the MD5 of the single-part object; use as a fast proxy
+            content_hash = f"{size}:etag-{etag}"
+            LOG.debug("Using ETag quick-check for %s -> %s", key, content_hash)
+            return content_hash, obj
+
+        # fallback: compute SHA256 by streaming object
+        try:
+            sha = compute_s3_object_sha256(s3_client, bucket, key)
+            content_hash = f"{size}:{sha}"
+            LOG.debug("Computed sha256 for %s -> %s", key, content_hash)
+            return content_hash, obj
+        except Exception as e:
+            LOG.error("Skipping %s due to error while hashing: %s", key, e)
+            return None
+
+    # Only examine size groups that have multiple objects (cheap filter)
+    groups_to_check = [g for s, g in size_groups.items() if len(g) > 1]
+    LOG.info("Size groups with candidates for duplication: %d", len(groups_to_check))
+
+    # Use thread pool; to avoid huge memory footprint, submit per-group (batching)
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        if tqdm:
+            group_iter = tqdm(groups_to_check, desc="Size groups", unit="group")
+        else:
+            group_iter = groups_to_check
+
+        for grp in group_iter:
+            # limit threads for small groups for efficiency
+            futures = []
+            for obj in grp:
+                futures.append(ex.submit(compute_for_obj, obj))
+
+            # process completed futures for this batch
+            if tqdm:
+                futures_iter = tqdm(as_completed(futures), total=len(futures), desc="hashing", leave=False)
+            else:
+                futures_iter = as_completed(futures)
+
+            for fut in futures_iter:
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    LOG.exception("Unexpected error processing future: %s", e)
+                    continue
+                if not result:
+                    # compute_for_obj returned None due to an error; already logged
+                    continue
+                content_hash, obj = result
+                duplicates.setdefault(content_hash, []).append(obj)
+
+    # Keep only groups with more than one object (true duplicates by our checks)
+    duplicates_filtered = {h: lst for h, lst in duplicates.items() if len(lst) > 1}
+    LOG.info("Duplicate content groups found: %d", len(duplicates_filtered))
+    return duplicates_filtered
+
+
+def handle_duplicates(
+    s3_client,
+    bucket: str,
+    duplicates: Dict[str, List[Dict]],
+    mode: str = "dry-run",
+    archive_prefix: Optional[str] = None,
+    keep: str = "first",
+) -> List[Dict]:
+    """
+    Handle duplicate groups according to mode and return action records for a manifest.
+
+    mode: 'dry-run' | 'delete' | 'move'
+    keep: 'first' | 'latest' | 'oldest' - which object to preserve (applied after deterministic sort)
+    """
+    if mode not in ("dry-run", "delete", "move"):
+        raise ValueError("mode must be one of 'dry-run', 'delete', 'move'")
+
+    actions: List[Dict] = []
+
+    def pick_keep_object(objs: List[Dict]) -> Dict:
+        if keep == "first":
+            return objs[0]
+        if keep == "latest":
+            return max(objs, key=lambda o: o["LastModified"])
+        if keep == "oldest":
+            return min(objs, key=lambda o: o["LastModified"])
+        # default fallback
+        return objs[0]
+
+    for content_hash, objs in duplicates.items():
+        # deterministic ordering by key helps reproducibility
+        objs_sorted = sorted(objs, key=lambda o: o["Key"])
+        keeper = pick_keep_object(objs_sorted)
+        duplicates_to_act = [o for o in objs_sorted if o["Key"] != keeper["Key"]]
+
+        for dup in duplicates_to_act:
+            action_record = {
+                "content_hash": content_hash,
+                "bucket": bucket,
+                "kept_key": keeper["Key"],
+                "duplicate_key": dup["Key"],
+                "size": dup["Size"],
+                "last_modified": dup["LastModified"].isoformat() if hasattr(dup["LastModified"], "isoformat") else str(dup["LastModified"]),
+                "action": None,
+                "result": None,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+
+            if mode == "dry-run":
+                action_record["action"] = "would-delete" if archive_prefix is None else "would-move"
+                action_record["result"] = "dry-run"
+                LOG.info("DRY-RUN: duplicate s3://%s/%s would be acted on (keeper: %s)", bucket, dup["Key"], keeper["Key"])
+
+            elif mode == "delete":
+                try:
+                    s3_client.delete_object(Bucket=bucket, Key=dup["Key"])
+                    action_record["action"] = "delete"
+                    action_record["result"] = "deleted"
+                    LOG.info("Deleted s3://%s/%s", bucket, dup["Key"])
+                except ClientError as e:
+                    LOG.error("Failed to delete s3://%s/%s: %s", bucket, dup["Key"], e)
+                    action_record["action"] = "delete"
+                    action_record["result"] = f"error: {e}"
+
+            elif mode == "move":
+                if not archive_prefix:
+                    raise ValueError("archive_prefix is required for move mode")
+                # build a safe destination key using posixpath
+                base_name = posixpath.basename(dup["Key"])
+                timestamp_prefix = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                destination_key = posixpath.join(archive_prefix.rstrip("/"), f"{timestamp_prefix}_{base_name}")
+                try:
+                    s3_client.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": dup["Key"]}, Key=destination_key)
+                    s3_client.delete_object(Bucket=bucket, Key=dup["Key"])
+                    action_record["action"] = "move"
+                    action_record["result"] = f"moved to {destination_key}"
+                    LOG.info("Moved s3://%s/%s -> s3://%s/%s", bucket, dup["Key"], bucket, destination_key)
+                except ClientError as e:
+                    LOG.error("Failed to move s3://%s/%s: %s", bucket, dup["Key"], e)
+                    action_record["action"] = "move"
+                    action_record["result"] = f"error: {e}"
+
+            actions.append(action_record)
+
+    return actions
+
+
+# ------------------------- Manifest output ---------------------------------
+
+
+def write_manifest_csv(path: str, actions: List[Dict]):
+    if not actions:
+        LOG.info("No actions to write to manifest.")
+        return
+    # Use a stable set of fieldnames (explicit) to ensure consistent CSV order
+    fieldnames = [
+        "timestamp",
+        "content_hash",
+        "bucket",
+        "kept_key",
+        "duplicate_key",
+        "size",
+        "last_modified",
+        "action",
+        "result",
+    ]
+    # fall back to keys from first action for any missing fields
+    first_keys = list(actions[0].keys())
+    for k in first_keys:
+        if k not in fieldnames:
+            fieldnames.append(k)
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for a in actions:
+            writer.writerow(a)
+    LOG.info("Wrote manifest to %s", path)
+
+
+def write_manifest_dynamodb(table_name: str, actions: List[Dict], region_name: Optional[str] = None):
+    """
+    Optional: write actions to DynamoDB. Table must exist with appropriate schema.
+    """
+    if not actions:
+        return
+    dynamo = boto3.resource("dynamodb", config=BOTO_CONFIG, region_name=region_name)
+    table = dynamo.Table(table_name)
+    for a in actions:
+        item = a.copy()
+        try:
+            table.put_item(Item=item)
+        except ClientError as e:
+            LOG.error("Failed to write manifest item to DynamoDB: %s", e)
+
+
+# ------------------------- CLI entry point ---------------------------------
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="S3 deduplication utility")
+    p.add_argument("--bucket", required=True, help="S3 bucket name")
+    p.add_argument("--prefix", default=None, help="S3 prefix to limit scan")
+    p.add_argument("--mode", choices=["dry-run", "delete", "move"], default="dry-run", help="Action to take")
+    p.add_argument("--archive-prefix", default=None, help="S3 prefix to move duplicates into (required for move)")
+    p.add_argument("--keep", choices=["first", "latest", "oldest"], default="first", help="Which duplicate to keep")
+    p.add_argument("--threads", type=int, default=8, help="Worker threads for hashing")
+    p.add_argument("--manifest", default=f"dedup_manifest_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv", help="Local CSV manifest path")
+    p.add_argument("--region", default=None, help="AWS region (optional)")
+    p.add_argument("--no-etag-quickcheck", action="store_true", help="Disable quick ETag check and always compute SHA256 when metadata not present")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    s3_client = boto3.client("s3", config=BOTO_CONFIG, region_name=args.region)
+
+    use_etag_quickcheck = not args.no_etag_quickcheck
+
+    duplicates = find_duplicates(
+        s3_client,
+        args.bucket,
+        args.prefix,
+        threads=args.threads,
+        use_etag_quickcheck=use_etag_quickcheck,
+    )
+    actions = handle_duplicates(
+        s3_client,
+        args.bucket,
+        duplicates,
+        mode=args.mode,
+        archive_prefix=args.archive_prefix,
+        keep=args.keep,
+    )
+    write_manifest_csv(args.manifest, actions)
+
+    LOG.info("Completed. Manifest: %s. Actions performed: %d", args.manifest, len(actions))
+
+
+# ------------------------- Example Lambda handler --------------------------
+
+
+def lambda_handler(event, context):
+    """
+    Lightweight Lambda handler to trigger a dedup run. Validate required env vars.
+    """
+    LOG.info("Lambda dedup triggered")
+    s3_client = boto3.client("s3", config=BOTO_CONFIG)
+    bucket = os.environ.get("TARGET_BUCKET")
+    if not bucket:
+        LOG.error("TARGET_BUCKET environment variable is required")
+        return {"status": "error", "message": "TARGET_BUCKET required"}
+
+    prefix = os.environ.get("TARGET_PREFIX")
+    mode = os.environ.get("MODE", "dry-run")
+    archive_prefix = os.environ.get("ARCHIVE_PREFIX")
+    threads = int(os.environ.get("THREADS", "4"))
+
+    duplicates = find_duplicates(s3_client, bucket, prefix, threads=threads, use_etag_quickcheck=True)
+    actions = handle_duplicates(s3_client, bucket, duplicates, mode=mode, archive_prefix=archive_prefix)
+    manifest_path = f"/tmp/lambda_dedup_manifest_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
+    write_manifest_csv(manifest_path, actions)
+
+    if os.environ.get("UPLOAD_MANIFEST") == "1":
+        dest_key = posixpath.join("dedup-manifests", os.path.basename(manifest_path))
+        try:
+            s3_client.upload_file(manifest_path, bucket, dest_key)
+            LOG.info("Uploaded manifest to s3://%s/%s", bucket, dest_key)
+        except ClientError as e:
+            LOG.error("Failed to upload manifest: %s", e)
+
+    return {"status": "ok", "actions": len(actions)}
+
+
+if __name__ == "__main__":
+    main()
